@@ -1,0 +1,338 @@
+--- a/drivers/net/wireless/ath/ath9k/ath9k.h
++++ b/drivers/net/wireless/ath/ath9k/ath9k.h
+@@ -379,7 +379,7 @@ struct ath_vif {
+  * number of beacon intervals, the game's up.
+  */
+ #define BSTUCK_THRESH           	9
+-#define	ATH_BCBUF               	8
++#define	ATH_BCBUF               	16
+ #define ATH_DEFAULT_BINTVAL     	100 /* TU */
+ #define ATH_DEFAULT_BMISS_LIMIT 	10
+ #define IEEE80211_MS_TO_TU(x)           (((x) * 1000) / 1024)
+@@ -394,6 +394,12 @@ struct ath_beacon_config {
+ 	bool ibss_creator;
+ };
+ 
++struct ath_vbeacon{
++  u8 vbssid[ETH_ALEN];
++  int slot;
++  __le64 tsf_adjust;
++};
++
+ struct ath_beacon {
+ 	enum {
+ 		OK,		/* no change needed */
+@@ -405,6 +411,7 @@ struct ath_beacon {
+ 	u32 bmisscnt;
+ 	u32 bc_tstamp;
+ 	struct ieee80211_vif *bslot[ATH_BCBUF];
++  struct ath_vbeacon vbslot[ATH_BCBUF];
+ 	int slottime;
+ 	int slotupdate;
+ 	struct ath9k_tx_queue_info beacon_qi;
+@@ -424,7 +431,8 @@ void ath9k_beacon_assign_slot(struct ath
+ void ath9k_beacon_remove_slot(struct ath_softc *sc, struct ieee80211_vif *vif);
+ void ath9k_set_tsfadjust(struct ath_softc *sc, struct ieee80211_vif *vif);
+ void ath9k_set_beacon(struct ath_softc *sc);
+-
++void ath9k_add_vbeacon(struct ath_softc *sc, u8 *vbssid);
++void ath9k_del_vbeacon(struct ath_softc *sc, u8 *vbssid);
+ /*******************/
+ /* Link Monitoring */
+ /*******************/
+--- a/drivers/net/wireless/ath/ath9k/beacon.c
++++ b/drivers/net/wireless/ath/ath9k/beacon.c
+@@ -195,6 +195,117 @@ static struct ath_buf *ath9k_beacon_gene
+ 	return bf;
+ }
+ 
++/* adjust tsf for this virtual beacon slot. */
++void ath9k_set_vtsfadjust(struct ath_softc *sc, int slot)
++{
++	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
++	struct ath_beacon_config *cur_conf = &sc->cur_beacon_conf;
++	u64 tsfadjust;
++
++	if (slot == 0)
++		return;
++
++	tsfadjust = cur_conf->beacon_interval * slot / ATH_BCBUF;
++	sc->beacon.vbslot[slot].tsf_adjust = cpu_to_le64(TU_TO_USEC(tsfadjust));
++	ath_dbg(common, CONFIG, "vtsfadjust is: %llu for bslot: %d\n",
++		(unsigned long long)tsfadjust, slot);
++}
++
++
++/* Generate vbeacon for a specific slot */
++static struct ath_buf *ath9k_vbeacon_generate(struct ieee80211_hw *hw, 
++					      struct ieee80211_vif *vif, 
++					      int slot)
++{
++  struct ath_buf *bf;
++  struct ieee80211_hdr * hdr;
++  struct ieee80211_mgmt * mgmt_hdr;
++  struct ath_softc *sc = hw->priv;
++  struct sk_buff *skb;
++
++  /* do not generate beacon for the default vif. */
++  if (slot == 0)
++    return NULL;
++
++  bf = ath9k_beacon_generate(hw, vif);
++
++  if (bf == NULL)
++    return NULL;
++  skb = bf->bf_mpdu;
++  hdr = (struct ieee80211_hdr *)skb->data;
++  memcpy(hdr->addr2, sc->beacon.vbslot[slot].vbssid, ETH_ALEN);
++  memcpy(hdr->addr3, sc->beacon.vbslot[slot].vbssid, ETH_ALEN);
++  
++  mgmt_hdr = (struct ieee80211_mgmt *)skb->data;
++  mgmt_hdr->u.beacon.timestamp = sc->beacon.vbslot[slot].tsf_adjust;
++
++  return bf;
++
++}
++
++void ath9k_add_vbeacon(struct ath_softc *sc, u8 * vbssid)
++{
++  struct ieee80211_vif *vif;
++  struct ath_vif *avp;
++  int slot;
++  struct ath_common *common = ath9k_hw_common(sc->sc_ah);
++
++  mutex_lock(&sc->mutex);
++  vif = sc->beacon.bslot[0];
++  if (!vif)
++    return;
++  avp = (void *)vif->drv_priv;
++  /* Check that we don't have a vbeacon running for this vbssid already. */
++  for (slot = 0; slot < ATH_BCBUF; slot++){
++    if (memcmp(sc->beacon.vbslot[slot].vbssid, vbssid, ETH_ALEN) == 0)
++      return;
++  }
++
++  for (slot = 0; slot < ATH_BCBUF; slot++){
++    if (sc->beacon.bslot[slot] == NULL) {
++      break;
++    }
++  }
++  sc->beacon.bslot[slot] = vif;
++  memcpy(sc->beacon.vbslot[slot].vbssid,vbssid, ETH_ALEN);
++  sc->beacon.vbslot[slot].slot = slot;
++  ath9k_set_vtsfadjust(sc, slot);
++  sc->nbcnvifs++;
++  mutex_unlock(&sc->mutex);
++  ath_dbg(common, BEACON, "Added vbeacon %pM at slot : %d\n", vbssid, slot);
++}
++
++void ath9k_del_vbeacon(struct ath_softc *sc, u8 * vbssid)
++{
++  struct ieee80211_vif *vif;
++  struct ath_vif *avp;
++  struct ath_buf *bf;
++  int slot;
++  struct ath_common *common = ath9k_hw_common(sc->sc_ah);
++
++  mutex_lock(&sc->mutex);
++  vif = sc->beacon.bslot[0];
++  if (!vif)
++    return;
++  avp = (void *)vif->drv_priv;
++  bf = avp->av_bcbuf;
++
++  tasklet_disable(&sc->bcon_tasklet);
++  for (slot = 0; slot < ATH_BCBUF; slot++){
++    if (memcmp(sc->beacon.vbslot[slot].vbssid, vbssid, ETH_ALEN) == 0)
++      break;
++  }
++  sc->beacon.bslot[slot] = NULL;
++  memset(sc->beacon.vbslot[slot].vbssid,0,ETH_ALEN);
++  sc->beacon.vbslot[slot].slot = 0;
++  sc->nbcnvifs--;
++  tasklet_enable(&sc->bcon_tasklet);
++  mutex_unlock(&sc->mutex);
++
++  ath_dbg(common, BEACON, "Removing vbeacon %pM from slot %d\n", vbssid, slot);
++
++}
++
+ void ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif)
+ {
+ 	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
+@@ -342,7 +453,7 @@ void ath9k_beacon_tasklet(unsigned long
+ 	if (!vif || !vif->bss_conf.enable_beacon)
+ 		return;
+ 
+-	bf = ath9k_beacon_generate(sc->hw, vif);
++	bf = ath9k_vbeacon_generate(sc->hw, vif, slot);
+ 
+ 	if (sc->beacon.bmisscnt != 0) {
+ 		ath_dbg(common, BSTUCK, "resume beacon xmit after %u misses\n",
+@@ -355,7 +466,7 @@ void ath9k_beacon_tasklet(unsigned long
+ 	 * an 11g network.  The 802.11 layer notifies us via callback,
+ 	 * we mark updateslot, then wait one beacon before effecting
+ 	 * the change.  This gives associated stations at least one
+-	 * beacon interval to note the state change.
++7	 * beacon interval to note the state change.
+ 	 *
+ 	 * NB: The slot time change state machine is clocked according
+ 	 *     to whether we are bursting or staggering beacons.  We
+--- a/drivers/net/wireless/ath/ath9k/debug.c
++++ b/drivers/net/wireless/ath/ath9k/debug.c
+@@ -1392,6 +1392,65 @@ static const struct file_operations fops
+   .llseek = default_llseek,
+ };
+ 
++static ssize_t write_file_addbeacon(struct file *file, const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++  struct ath_softc *sc = file->private_data;
++  struct ath_hw *ah = sc->sc_ah;
++  struct ath_common *common = ath9k_hw_common(ah);
++  char buf[32];
++  u8 vbssid[ETH_ALEN];
++  ssize_t len;
++
++  len = min(count, sizeof(buf) -1);
++  if (copy_from_user(buf, user_buf, len))
++    return -EFAULT;
++
++  buf[len] = '\0';
++  sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &vbssid[0],&vbssid[1],
++	 &vbssid[2], &vbssid[3], &vbssid[4], &vbssid[5]);
++
++  ath9k_add_vbeacon(sc, vbssid);
++  return count;
++}
++
++static const struct file_operations fops_addbeacon = {
++  .write = write_file_addbeacon,
++  .open = simple_open,
++  .owner = THIS_MODULE,
++  .llseek = default_llseek,
++};
++
++static ssize_t write_file_delbeacon(struct file *file, const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++  struct ath_softc *sc = file->private_data;
++  struct ath_hw *ah = sc->sc_ah;
++  struct ath_common *common = ath9k_hw_common(ah);
++  char buf[32];
++  u8 vbssid[ETH_ALEN];
++  ssize_t len;
++
++  len = min(count, sizeof(buf) -1);
++  if (copy_from_user(buf, user_buf, len))
++    return -EFAULT;
++
++  buf[len] = '\0';
++  sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &vbssid[0],&vbssid[1],
++	 &vbssid[2], &vbssid[3], &vbssid[4], &vbssid[5]);
++
++  ath9k_del_vbeacon(sc, vbssid);
++  return count;
++}
++
++static const struct file_operations fops_delbeacon = {
++  .write = write_file_delbeacon,
++  .open = simple_open,
++  .owner = THIS_MODULE,
++  .llseek = default_llseek,
++};
++
++
+ #define REGDUMP_LINE_SIZE	20
+ 
+ static int open_file_regdump(struct inode *inode, struct file *file)
+@@ -2044,6 +2103,10 @@ int ath9k_init_debug(struct ath_hw *ah)
+ 			    sc, &fops_regval);
+ 	debugfs_create_file("bssidmask", S_IRUSR | S_IWUSR, sc->debug.debugfs_phy,
+ 			    sc, &fops_bssidmask);
++	debugfs_create_file("addbeacon", S_IWUSR, sc->debug.debugfs_phy,
++			    sc, &fops_addbeacon);
++	debugfs_create_file("delbeacon", S_IWUSR, sc->debug.debugfs_phy,
++			    sc, &fops_delbeacon);
+ 	debugfs_create_bool("ignore_extcca", S_IRUSR | S_IWUSR,
+ 			    sc->debug.debugfs_phy,
+ 			    &ah->config.cwm_ignore_extcca);
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1692,6 +1692,12 @@ fail:
+ 	return NETDEV_TX_OK; /* meaning, we dealt with the skb */
+ }
+ 
++
++
++    
++
++
++
+ /**
+  * ieee80211_subif_start_xmit - netif start_xmit function for Ethernet-type
+  * subinterfaces (wlan#, WDS, and VLAN interfaces)
+@@ -1707,8 +1713,8 @@ fail:
+  * encapsulated packet will then be passed to master interface, wlan#.11, for
+  * transmission (through low-level driver).
+  */
+-netdev_tx_t ieee80211_subif_start_xmit(struct sk_buff *skb,
+-				    struct net_device *dev)
++netdev_tx_t _ieee80211_subif_start_xmit(struct sk_buff *skb,
++					struct net_device *dev, u8 * bcast_vbssid)
+ {
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 	struct ieee80211_local *local = sdata->local;
+@@ -1783,6 +1789,11 @@ netdev_tx_t ieee80211_subif_start_xmit(s
+ 			/* set the bssid to this station's vbssid */
+ 			memcpy(hdr.addr2, sta->sta.vbssid, ETH_ALEN);
+ 		}
++		else if (is_multicast_ether_addr(skb->data) && (bcast_vbssid != NULL)){
++		  /* get explicit bssid information for this node */
++		  memcpy(hdr.addr2, bcast_vbssid, ETH_ALEN);
++		}
++	  
+ 		break;
+ 	case NL80211_IFTYPE_WDS:
+ 		fc |= cpu_to_le16(IEEE80211_FCTL_FROMDS | IEEE80211_FCTL_TODS);
+@@ -2139,6 +2150,40 @@ netdev_tx_t ieee80211_subif_start_xmit(s
+ 	return NETDEV_TX_OK;
+ }
+ 
++/**
++ * Wrapper for ieee80211_subif_start_xmit to account for broadcast packets.
++ */
++netdev_tx_t ieee80211_subif_start_xmit(struct sk_buff *skb,
++					struct net_device *dev)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_local *local = sdata->local;
++
++	struct sta_info *sta;
++  
++
++	if (unlikely(skb->len < ETH_HLEN))
++	  goto fail;
++	
++	if ((sdata->vif.type == NL80211_IFTYPE_AP) && is_multicast_ether_addr(skb->data)){
++	  list_for_each_entry_rcu(sta, &local->sta_list, list){
++	    if ((sta) == NULL)
++	      continue;
++	    _ieee80211_subif_start_xmit(skb_clone(skb, GFP_ATOMIC), dev, sta->sta.vbssid);
++	  }
++	  //return NETDEV_TX_OK;
++	}
++	else
++	  return _ieee80211_subif_start_xmit(skb, dev, NULL);
++	
++	/* free the original buffer if the packet was multicast---we'll 
++	   only send vbssid-specific clones. */
++ fail:
++	dev_kfree_skb(skb);
++	return NETDEV_TX_OK;
++}
++
++
+ 
+ /*
+  * ieee80211_clear_tx_pending may not be called in a context where

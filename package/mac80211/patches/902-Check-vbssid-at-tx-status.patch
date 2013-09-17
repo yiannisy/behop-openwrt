@@ -1,0 +1,11 @@
+--- a/net/mac80211/status.c	2013-06-30 07:34:54.000000000 -0700
++++ b/net/mac80211/status.c	2013-09-04 18:33:44.128093010 -0700
+@@ -455,7 +455,7 @@
+ 
+ 	for_each_sta_info(local, hdr->addr1, sta, tmp) {
+ 		/* skip wrong virtual interface */
+-		if (!ether_addr_equal(hdr->addr2, sta->sdata->vif.addr))
++	  if (!ether_addr_equal(hdr->addr2, sta->sdata->vif.addr) && !ether_addr_equal(hdr->addr2, sta->sta.vbssid))
+ 			continue;
+ 
+ 		if (info->flags & IEEE80211_TX_STATUS_EOSP)
