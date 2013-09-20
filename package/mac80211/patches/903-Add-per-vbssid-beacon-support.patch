@@ -42,7 +42,7 @@
  /*******************/
 --- a/drivers/net/wireless/ath/ath9k/beacon.c
 +++ b/drivers/net/wireless/ath/ath9k/beacon.c
-@@ -195,6 +195,117 @@ static struct ath_buf *ath9k_beacon_gene
+@@ -195,6 +195,126 @@ static struct ath_buf *ath9k_beacon_gene
  	return bf;
  }
  
@@ -103,13 +103,19 @@
 +
 +  mutex_lock(&sc->mutex);
 +  vif = sc->beacon.bslot[0];
-+  if (!vif)
++  if (!vif){
++    ath_dbg(common, BEACON,"Added vbeacon skipped for %pM ---  no vif\n",vbssid);
++    mutex_unlock(&sc->mutex);
 +    return;
++  }
 +  avp = (void *)vif->drv_priv;
 +  /* Check that we don't have a vbeacon running for this vbssid already. */
 +  for (slot = 0; slot < ATH_BCBUF; slot++){
-+    if (memcmp(sc->beacon.vbslot[slot].vbssid, vbssid, ETH_ALEN) == 0)
++    if (memcmp(sc->beacon.vbslot[slot].vbssid, vbssid, ETH_ALEN) == 0){
++      ath_dbg(common, BEACON,"Added vbeacon skipped for %pM ---  vbeacon exists\n",vbssid);
++      mutex_unlock(&sc->mutex);
 +      return;
++    }
 +  }
 +
 +  for (slot = 0; slot < ATH_BCBUF; slot++){
@@ -136,8 +142,11 @@
 +
 +  mutex_lock(&sc->mutex);
 +  vif = sc->beacon.bslot[0];
-+  if (!vif)
++  if (!vif){
++    ath_dbg(common, BEACON,"Removing vbeacon skipped for %pM ---  no vif\n",vbssid);
++    mutex_unlock(&sc->mutex);
 +    return;
++  }
 +  avp = (void *)vif->drv_priv;
 +  bf = avp->av_bcbuf;
 +
@@ -160,7 +169,7 @@
  void ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif)
  {
  	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
-@@ -342,7 +453,7 @@ void ath9k_beacon_tasklet(unsigned long
+@@ -342,7 +462,7 @@ void ath9k_beacon_tasklet(unsigned long
  	if (!vif || !vif->bss_conf.enable_beacon)
  		return;
  
@@ -169,7 +178,7 @@
  
  	if (sc->beacon.bmisscnt != 0) {
  		ath_dbg(common, BSTUCK, "resume beacon xmit after %u misses\n",
-@@ -355,7 +466,7 @@ void ath9k_beacon_tasklet(unsigned long
+@@ -355,7 +475,7 @@ void ath9k_beacon_tasklet(unsigned long
  	 * an 11g network.  The 802.11 layer notifies us via callback,
  	 * we mark updateslot, then wait one beacon before effecting
  	 * the change.  This gives associated stations at least one
